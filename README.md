@@ -184,7 +184,7 @@ In `~/.config/opencode/opencode.json`:
 ```json
 {
   "provider": {
-    "auriga-dense": {
+    "your-provider": {
       "options": {
         "baseURL": "http://127.0.0.1:8099/v1"
       }
@@ -241,10 +241,10 @@ Or set `"clearCache": true` in `kv-warmup.json` to clear the capture for the cur
 
 ### 5. Verify
 
-The warmup runs in the background when OpenCode starts. There is no visible indicator on the welcome screen — the TUI sidebar panel only appears after the first message is sent. To verify the warmup is working:
+The warmup runs in the background when OpenCode starts. The home screen footer shows `KV Warming...` during warmup and `KV Ready` when done. To verify:
 
-1. Start OpenCode and **wait ~45 seconds** before typing (let the background warmup finish)
-2. Send any message — TTFT should be ~1s instead of ~44s
+1. Start OpenCode and wait for the footer to show `KV Ready`
+2. Send any message — TTFT should be ~1s instead of ~39s
 3. The sidebar will show `Ready` with warmup timing details
 
 Alternatively, check llama-server logs for `LCP similarity` — values above 0.95 confirm prefix cache hit. You can also inspect the status file directly:
