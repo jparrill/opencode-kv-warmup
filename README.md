@@ -20,6 +20,14 @@ Additionally, for single-slot mode (`-np 1`), the plugin redirects OpenCode's in
 
 **Result: TTFT drops from ~44s to ~1s with `-np 1`.**
 
+### Before (no cache warmup) — TTFT ~44s
+
+![Before proxy caching](docs/demo-before.gif)
+
+### After (with cache warmup) — TTFT ~1s
+
+![After proxy caching](docs/demo-after.gif)
+
 ![KV Warmup Ready](docs/warmup-ready.png)
 
 ## Why a proxy is required
