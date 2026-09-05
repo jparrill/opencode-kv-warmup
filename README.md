@@ -10,9 +10,15 @@ Subsequent turns within the same conversation are fast (~0.5s) because llama-ser
 
 ## Solution
 
-The plugin replays a previously captured request to llama-server at OpenCode boot time, with `max_tokens: 1`. This populates the KV cache with the exact token sequence that OpenCode will send on the first real request. When the actual request arrives, llama-server's LCP (Longest Common Prefix) matching detects 99.9% overlap and skips prompt processing entirely.
+The plugin embeds a reverse proxy inside the plugin process. OpenCode sends all requests through this proxy, which:
 
-**Result: TTFT drops from ~65s to ~2.6s (96% reduction).**
+1. **Forwards** every request to the real llama-server endpoint transparently
+2. **Captures** the latest large request body (system prompt + tools + messages) automatically
+3. On next OpenCode boot, **replays** the captured request directly to llama-server with `max_tokens: 1`, filling the KV cache before the user types
+
+Additionally, for single-slot mode (`-np 1`), the plugin redirects OpenCode's internal "small model" tasks (title generation, etc.) to a secondary MoE endpoint via the `experimental.provider.small_model` hook. This prevents title gen from evicting the warmed KV cache.
+
+**Result: TTFT drops from ~65s to ~2.6s (96% reduction) with `-np 1`.**
 
 ## Why it works this way
 
@@ -22,53 +28,67 @@ Three constraints forced this architecture:
 
 llama-server's prefix cache compares the incoming request's token sequence against what's already in a KV slot. Even a single token difference at position N invalidates everything from N onwards. Early attempts using plugin hooks to reconstruct the request failed because:
 
-- The `tool.definition` hook provides full JSON schemas (~60K chars), but OpenCode sends compact versions (~24K chars) — different tokens
-- The `experimental.chat.system.transform` hook joins system messages into one string, but OpenCode sends them as separate messages — different chat template rendering
-- Injecting status text into the system prompt (e.g., `[kv-warmup] KV cache pre-warmed`) changes the token sequence vs. the captured request
+- The `tool.definition` hook provides full JSON schemas (~60K chars), but OpenCode sends compact versions (~24K chars)
+- The `experimental.chat.system.transform` hook joins system messages into one string, but OpenCode sends them as separate messages
+- Injecting status text into the system prompt changes the token sequence vs. the captured request
 
 The only reliable approach is capturing the **exact request body** that OpenCode sends to the API and replaying it verbatim.
 
-### 2. Two parallel slots are required (`-np 2`)
+### 2. Title gen evicts KV cache on single slot
 
-With a single slot (`-np 1`), OpenCode's internal title-generation request evicts the warmed KV cache before the user's real request arrives:
-
-```
-warmup → slot 0 (KV primed)
-title gen → slot 0 (KV evicted!)
-user request → slot 0 (full reprocessing, warmup wasted)
-```
-
-With two slots (`-np 2`), llama-server's LCP-based slot selection routes each request to the best-matching slot:
+With `-np 1`, OpenCode's internal title-generation request evicts the warmed KV cache before the user's real request arrives:
 
 ```
-warmup → slot 1 (KV primed, 15K tokens)
-title gen → slot 0 (empty, no match with warmup)
-user request → slot 1 (LCP 99.9%, 15 tokens to process)
+warmup fills slot 0 (KV primed)
+title gen evicts slot 0 (KV lost!)
+user request reprocesses from scratch (warmup wasted)
 ```
 
-### 3. The plugin must not modify the system prompt
+The plugin solves this by redirecting title gen to a separate MoE endpoint (`smallModelEndpoint`), so the dense server's KV cache is never touched by non-conversation requests.
+
+### 3. System prompt varies by directory
+
+System prompt content changes with working directory, CLAUDE.md, loaded skills, and MCP config. A static capture becomes stale when you switch directories. The embedded proxy solves this by auto-capturing every request — the warmup data is always from the latest real conversation, regardless of directory changes.
+
+### 4. The plugin must not modify the system prompt
 
 Any modification to `output.system` in the `experimental.chat.system.transform` hook changes what OpenCode sends to the API, breaking the prefix match with the captured request. Warmup status is shown in the TUI sidebar panel instead.
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│ OpenCode boot                                       │
-│                                                     │
-│  plugin.js loads → reads .kv-warmup-request.json    │
-│  → sends captured request to llama-server            │
-│     (max_tokens: 1, replaces user msg with "ping")  │
-│  → llama-server processes ~15K tokens (~46s)        │
-│  → KV cache primed in slot 1                        │
-│                                                     │
-│  User types first message                           │
-│  → title gen → slot 0 (no KV match)                 │
-│  → real request → slot 1 (LCP 99.9%)               │
-│  → only ~15 new tokens processed                    │
-│  → TTFT: 2.6s                                       │
-└─────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│ OpenCode                                                 │
+│  provider baseURL → http://127.0.0.1:8099/v1             │
+│                                                          │
+│  ┌─────────────────────────────────────────────────────┐ │
+│  │ plugin.js (runs inside OpenCode process)             │ │
+│  │                                                      │ │
+│  │  On boot:                                            │ │
+│  │    1. Start HTTP proxy on 127.0.0.1:8099             │ │
+│  │    2. Load last captured request from disk            │ │
+│  │    3. Replay to real endpoint (max_tokens:1)         │ │
+│  │                                                      │ │
+│  │  Proxy (always running):                             │ │
+│  │    All requests → capture large ones → forward       │ │
+│  │                                                      │ │
+│  │  Small model hook:                                   │ │
+│  │    Title gen → MoE endpoint (8091)                   │ │
+│  │    (prevents KV eviction on dense server)            │ │
+│  └─────────────┬────────────────────────────────────────┘ │
+└────────────────┼──────────────────────────────────────────┘
+                 │
+    ┌────────────┼─────────────────┐
+    │ warmup     │ proxy forward   │
+    │ (direct)   │                 │
+    ▼            ▼                 │
+┌─────────────────────┐    ┌──────┴──────────┐
+│ Dense server :8090  │    │ MoE server :8091│
+│ (KV cache primed)   │    │ (title gen)     │
+└─────────────────────┘    └─────────────────┘
+```
 
+```
 ┌─────────────────────────────────────────────────────┐
 │ TUI sidebar (tui.tsx)                               │
 │                                                     │
@@ -81,46 +101,41 @@ Any modification to `output.system` in the `experimental.chat.system.transform` 
 
 | File | Purpose |
 |------|---------|
-| `plugin.js` | Server-side plugin: warmup on boot, fallback capture via hooks |
+| `plugin.js` | Embedded proxy + warmup on boot + small model redirect |
 | `tui.tsx` | TUI sidebar panel: shows warmup state with colored indicators |
-| `proxy.js` | One-time capture tool: intercepts OpenCode's real request body |
+| `proxy.js` | Legacy standalone capture proxy (superseded by embedded proxy) |
 | `package.json` | Package metadata |
 
 ### Runtime files (in `~/.config/opencode/`)
 
 | File | Purpose |
 |------|---------|
-| `kv-warmup.json` | Plugin config: `enabled`, `endpoints` |
-| `.kv-warmup-request.json` | Captured request body (from proxy) |
+| `kv-warmup.json` | Plugin config |
+| `.kv-warmup-request.json` | Auto-captured request body (from embedded proxy) |
 | `.kv-warmup-status.json` | Current warmup state (read by TUI) |
 
 ## Setup
 
-### 1. Configure llama-server with `-np 2`
-
-Add `-np 2` to your llama-server launch flags. With `auriga-cli`:
-
-```yaml
-# ~/.config/auriga/config.yaml
-qwen3.8-27b-q4:
-    flags:
-        - -np
-        - '2'
-```
-
-Then restart: `auriga profile switch qwen3.8-27b-q4 --persistent`
-
-### 2. Register the plugin
+### 1. Register the plugin
 
 In `~/.config/opencode/opencode.json`:
 
 ```json
 {
+  "provider": {
+    "auriga-dense": {
+      "options": {
+        "baseURL": "http://127.0.0.1:8099/v1"
+      }
+    }
+  },
   "plugin": [
     "/path/to/kv-warmup/plugin.js"
   ]
 }
 ```
+
+Note: `baseURL` points to the proxy, not the real server.
 
 In `~/.config/opencode/tui.json`:
 
@@ -132,51 +147,32 @@ In `~/.config/opencode/tui.json`:
 }
 ```
 
-### 3. Create plugin config
+### 2. Create plugin config
 
 ```bash
 cat > ~/.config/opencode/kv-warmup.json << 'EOF'
 {
   "enabled": true,
-  "endpoints": ["http://your-llama-server:8090"]
+  "endpoint": "http://your-llama-server:8090",
+  "proxyPort": 8099,
+  "smallModelEndpoint": "http://your-llama-server:8091/v1"
 }
 EOF
 ```
 
-### 4. Capture a real request (one-time)
+- `endpoint`: real llama-server URL (proxy forwards here)
+- `proxyPort`: local proxy port (must match baseURL in opencode.json)
+- `smallModelEndpoint`: secondary server for title gen (prevents KV eviction)
 
-Edit the `TARGET_HOST` and `TARGET_PORT` constants in `proxy.js` to match your llama-server endpoint. Then:
+### 3. First run (bootstrap)
 
-```bash
-# 1. Point OpenCode to the proxy temporarily
-# In opencode.json, change baseURL to http://localhost:8099/v1
+On first boot, no captured request exists. The plugin logs `no captured request — will capture on first message`. Send any message — the proxy captures it. On the **second** boot, warmup uses that capture.
 
-# 2. Disable warmup during capture
-echo '{"enabled": false, "endpoints": []}' > ~/.config/opencode/kv-warmup.json
-
-# 3. Run the proxy
-node proxy.js
-
-# 4. Start OpenCode and send any message
-# The proxy captures the first large request
-
-# 5. Restore opencode.json to the real endpoint
-# 6. Re-enable warmup in kv-warmup.json
-```
-
-### 5. Verify
+### 4. Verify
 
 Start OpenCode. The sidebar should show `◐ Warming...` then `● Ready` after ~46s. Send a message — TTFT should be ~2-5s instead of ~65s.
 
-## When to re-capture
-
-Run the proxy capture again if:
-
-- OpenCode updates change tool definitions
-- You modify CLAUDE.md, AGENTS.md, or skill files significantly
-- You switch to a different llama-server model (different chat template)
-
-The symptom of a stale capture is TTFT reverting to ~50-65s. Check llama-server logs for `LCP similarity` — values below 0.95 indicate a prompt mismatch.
+Check llama-server logs for `LCP similarity` — values above 0.95 confirm prefix cache hit.
 
 ## Measured results
 

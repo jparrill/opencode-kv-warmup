@@ -2,27 +2,33 @@
 //
 // Pre-warms llama-server KV cache on session start to reduce TTFT.
 //
-// Strategy: replays a captured real request body (from proxy capture) to
-// llama-server with max_tokens:1. This creates an EXACT prefix match in the
-// KV cache, so the first real request skips prompt processing.
-//
-// Setup:
-//   1. Run proxy.js once to capture a real request
-//   2. This plugin reads the captured request on boot and replays it
-//   3. llama-server must run with -np 2 to avoid title-gen KV eviction
+// Architecture: embedded reverse proxy
+//   - Plugin starts an HTTP proxy on localhost (port from config)
+//   - OpenCode's provider baseURL points to the proxy
+//   - Proxy forwards all requests to the real llama-server endpoint
+//   - Proxy captures the latest large request body for future warmup
+//   - On next boot, plugin replays the captured request directly to the
+//     real endpoint (max_tokens:1), filling the KV cache before the user types
 //
 // Config: ~/.config/opencode/kv-warmup.json
 //   {
 //     "enabled": true,
-//     "endpoints": ["http://100.77.65.108:8090"]
+//     "endpoint": "http://100.77.65.108:8090",
+//     "proxyPort": 8099,
+//     "smallModelEndpoint": "http://100.77.65.108:8091/v1",
+//     "clearCache": false        // set true to delete capture for current dir (auto-resets)
 //   }
 //
-// Files:
-//   ~/.config/opencode/.kv-warmup-request.json — captured real request (from proxy)
-//   ~/.config/opencode/.kv-warmup-status.json  — warmup state for sidebar
+// Hot-reload: proxy re-reads config on every request.
+//   enabled: false  → proxy becomes transparent passthrough (no capture, no warmup on restart)
+//   clearCache: true → deletes capture for current dir, resets to false
+//
+// OpenCode provider baseURL must point to: http://localhost:<proxyPort>/v1
 
-import { readFileSync, writeFileSync, mkdirSync } from 'node:fs';
-import { join, dirname } from 'node:path';
+import { readFileSync, writeFileSync, mkdirSync, unlinkSync } from 'node:fs';
+import { join } from 'node:path';
+import { createHash } from 'node:crypto';
+import http from 'node:http';
 import os from 'node:os';
 
 function configDir() {
@@ -32,9 +38,18 @@ function configDir() {
   return join(os.homedir(), '.config', 'opencode');
 }
 
-const REQUEST_PATH = join(configDir(), '.kv-warmup-request.json');
+const CAPTURES_DIR = join(configDir(), '.kv-warmup-captures');
+const DEBUG_DIR = join(configDir(), '.kv-warmup-debug');
 const CONFIG_PATH = join(configDir(), 'kv-warmup.json');
 const STATUS_PATH = join(configDir(), '.kv-warmup-status.json');
+
+function dirHash(dir) {
+  return createHash('sha256').update(dir).digest('hex').slice(0, 12);
+}
+
+function requestPath() {
+  return join(CAPTURES_DIR, `${dirHash(process.cwd())}.json`);
+}
 
 function writeStatus(state, detail) {
   try {
@@ -51,96 +66,85 @@ function loadConfig() {
   try {
     return JSON.parse(readFileSync(CONFIG_PATH, 'utf8'));
   } catch {
-    return { enabled: true, endpoints: [] };
+    return { enabled: true, endpoint: '', proxyPort: 8099 };
   }
 }
 
 function loadCapturedRequest() {
   try {
-    const data = JSON.parse(readFileSync(REQUEST_PATH, 'utf8'));
-    return data.body || null;
+    return JSON.parse(readFileSync(requestPath(), 'utf8'));
   } catch {
     return null;
   }
 }
 
-// Save the real request body captured via system.transform + hooks.
-// This is a FALLBACK capture — the proxy capture produces better results.
-// The system.transform hook captures messages, but NOT tools in their
-// compact form. If .kv-warmup-request.json already exists from proxy
-// capture, this function preserves the tools from it.
-function saveCapturedRequest(messages) {
+function saveCapturedRequest(body) {
   try {
-    let existing = null;
-    try { existing = JSON.parse(readFileSync(REQUEST_PATH, 'utf8')); } catch {}
-
-    const body = {
-      messages,
-      model: existing?.body?.model || 'any',
-      max_tokens: 1,
-      stream: false,
-    };
-
-    // Preserve tools from proxy capture if available
-    if (existing?.body?.tools) {
-      body.tools = existing.body.tools;
-    }
-
-    const data = {
+    mkdirSync(CAPTURES_DIR, { recursive: true });
+    writeFileSync(requestPath(), JSON.stringify({
       body,
+      directory: process.cwd(),
       timestamp: new Date().toISOString(),
       bodySize: JSON.stringify(body).length,
-      hasTools: !!(body.tools && body.tools.length),
-      toolCount: (body.tools || []).length,
-      source: existing?.body?.tools ? 'hook+proxy-tools' : 'hook-only',
-    };
+    }, null, 2), 'utf8');
+  } catch {}
+}
 
-    mkdirSync(dirname(REQUEST_PATH), { recursive: true });
-    writeFileSync(REQUEST_PATH, JSON.stringify(data, null, 2), 'utf8');
-    return data;
+function deleteCapturedRequest() {
+  try {
+    unlinkSync(requestPath());
+    return true;
   } catch {
-    return null;
+    return false;
   }
+}
+
+function saveConfig(cfg) {
+  try {
+    writeFileSync(CONFIG_PATH, JSON.stringify(cfg, null, 2), 'utf8');
+  } catch {}
 }
 
 let warmupInFlight = false;
 let warmupAbort = null;
-let promptCaptured = false;
+let capturedThisSession = false;
 
-function log(msg) {
+function log() {}
+
+function logError(msg) {
   const ts = new Date().toISOString().slice(11, 19);
   process.stderr.write(`[kv-warmup ${ts}] ${msg}\n`);
 }
 
-async function sendWarmup(endpoint, requestBody) {
-  if (warmupInFlight) {
-    log('warmup already in flight, skipping');
-    return;
-  }
+function dumpRequestForDiff(parsed) {
+  try {
+    mkdirSync(DEBUG_DIR, { recursive: true });
+    const hash = dirHash(process.cwd());
+    const ts = new Date().toISOString().replace(/[:.]/g, '-');
+    const file = join(DEBUG_DIR, `${hash}_${ts}.json`);
+    writeFileSync(file, JSON.stringify(parsed, null, 2), 'utf8');
+  } catch {}
+}
 
-  warmupInFlight = true;
-  warmupAbort = new AbortController();
+// ─── Warmup ───
 
-  // Build warmup request from captured body
+function buildWarmupBody(requestBody) {
   const body = {
     ...requestBody,
     max_tokens: 1,
     stream: false,
-    // Replace user message with "ping" — prefix (system+tools) stays identical
-    messages: requestBody.messages.map((m, i) => {
-      if (m.role === 'user') return { ...m, content: 'ping' };
-      return m;
-    }),
+    messages: requestBody.messages.map(m =>
+      m.role === 'user' ? { ...m, content: 'ping' } : m
+    ),
   };
-
-  // Remove streaming options
   delete body.stream_options;
+  return body;
+}
 
+async function sendWarmup(endpoint, requestBody, signal) {
+  const body = buildWarmupBody(requestBody);
   const url = endpoint.replace(/\/+$/, '') + '/v1/chat/completions';
-  const msgChars = body.messages.reduce((s, m) => s + (m.content || '').length, 0);
-  const toolCount = (body.tools || []).length;
-  log(`warmup start: ${url} (~${msgChars} chars, ${toolCount} tools)`);
-  writeStatus('warming', `${url} — ~${msgChars} chars, ${toolCount} tools`);
+  writeStatus('warming', 'priming KV cache...');
 
   const start = Date.now();
   try {
@@ -148,116 +152,251 @@ async function sendWarmup(endpoint, requestBody) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-      signal: warmupAbort.signal,
+      signal,
     });
     const elapsed = ((Date.now() - start) / 1000).toFixed(1);
     if (resp.ok) {
       const result = await resp.json().catch(() => ({}));
       const tokens = result?.usage?.prompt_tokens || '?';
-      log(`warmup done in ${elapsed}s — ${tokens} tokens primed`);
       writeStatus('ready', `KV cache primed in ${elapsed}s (${tokens} tokens)`);
+      return true;
     } else {
-      const text = await resp.text().catch(() => '');
-      log(`warmup failed (${resp.status}) after ${elapsed}s: ${text.slice(0, 200)}`);
+      logError(`warmup failed (${resp.status}) after ${elapsed}s`);
       writeStatus('error', `HTTP ${resp.status} after ${elapsed}s`);
+      return false;
     }
   } catch (err) {
-    if (err.name === 'AbortError') {
-      log('warmup aborted (user sent message before warmup finished)');
-      writeStatus('cancelled', 'user typed before warmup finished');
-    } else {
+    if (err.name !== 'AbortError') {
       const elapsed = ((Date.now() - start) / 1000).toFixed(1);
-      log(`warmup error after ${elapsed}s: ${err.message}`);
+      logError(`warmup error: ${err.message}`);
       writeStatus('error', `${err.message} after ${elapsed}s`);
     }
-  } finally {
-    warmupInFlight = false;
-    warmupAbort = null;
+    return false;
   }
 }
 
-function cancelWarmup() {
-  if (warmupAbort) {
-    warmupAbort.abort();
-    warmupAbort = null;
-    warmupInFlight = false;
+function initWarmup(config) {
+  if (!config.enabled || !config.endpoint) {
+    writeStatus(config.enabled ? 'error' : 'disabled',
+      config.enabled ? 'no endpoint in kv-warmup.json' : 'set enabled: true in kv-warmup.json');
+    return;
   }
+  const cached = loadCapturedRequest();
+  if (!cached || !cached.body?.messages?.length) {
+    writeStatus('no-cache', 'will capture on first message');
+    return;
+  }
+  sendWarmup(config.endpoint, cached.body);
 }
 
-function triggerWarmup() {
-  const config = loadConfig();
-  if (!config.enabled) {
-    log('disabled by config');
-    writeStatus('disabled', 'set enabled: true in kv-warmup.json');
-    return;
-  }
+// ─── Embedded Proxy ───
 
-  const endpoints = config.endpoints || [];
-  if (endpoints.length === 0) {
-    log('no endpoints configured');
-    writeStatus('error', 'no endpoints in kv-warmup.json');
-    return;
-  }
+let inlineWarmupDone = false;
 
-  const captured = loadCapturedRequest();
-  if (!captured || !captured.messages || captured.messages.length === 0) {
-    log('no captured request — run proxy.js first, or send a message to capture');
-    writeStatus('no-cache', 'no captured request — send a message to capture one');
-    return;
-  }
+function forwardRequest(targetHost, targetPort, req, res, rawBody) {
+  const proxyReq = http.request({
+    hostname: targetHost,
+    port: targetPort,
+    path: req.url,
+    method: req.method,
+    headers: { ...req.headers, host: `${targetHost}:${targetPort}` },
+  }, proxyRes => {
+    res.writeHead(proxyRes.statusCode, proxyRes.headers);
+    proxyRes.pipe(res);
+  });
 
-  const msgChars = captured.messages.reduce((s, m) => s + (m.content || '').length, 0);
-  const toolCount = (captured.tools || []).length;
-  log(`loaded captured request: ${captured.messages.length} msgs, ~${msgChars} chars, ${toolCount} tools`);
+  proxyReq.on('error', err => {
+    logError(`proxy forward error: ${err.message}`);
+    res.writeHead(502);
+    res.end(JSON.stringify({
+      error: { message: `kv-warmup proxy: cannot reach ${targetHost}:${targetPort} — ${err.message}` },
+    }));
+  });
 
-  for (const endpoint of endpoints) {
-    sendWarmup(endpoint, captured);
-  }
+  proxyReq.write(rawBody);
+  proxyReq.end();
 }
+
+function startProxy(config) {
+  const targetUrl = new URL(config.endpoint);
+  const targetHost = targetUrl.hostname;
+  const targetPort = parseInt(targetUrl.port) || 80;
+  const proxyPort = config.proxyPort || 8099;
+
+  const server = http.createServer((req, res) => {
+    let chunks = [];
+    req.on('data', chunk => chunks.push(chunk));
+    req.on('end', async () => {
+      const rawBody = Buffer.concat(chunks).toString();
+      const isChatCompletion = rawBody.length > 5000 && req.url.includes('/chat/completions');
+
+      const hotConfig = loadConfig();
+
+      if (hotConfig.clearCache) {
+        deleteCapturedRequest();
+        capturedThisSession = false;
+        inlineWarmupDone = false;
+        hotConfig.clearCache = false;
+        saveConfig(hotConfig);
+        writeStatus('cache-cleared', 'capture deleted, will re-capture on next message');
+      }
+
+      // Disabled: inline warmup adds 43.5s when KV is cold.
+      // TODO: re-enable once we fix the ~32% system prompt token drift between sessions.
+
+      if (isChatCompletion && hotConfig.enabled !== false && !capturedThisSession) {
+        capturedThisSession = true;
+        try {
+          const parsed = JSON.parse(rawBody);
+          saveCapturedRequest(parsed);
+          dumpRequestForDiff(parsed);
+        } catch {}
+      }
+
+      forwardRequest(targetHost, targetPort, req, res, rawBody);
+    });
+  });
+
+  return new Promise((resolve) => {
+    server.on('error', err => {
+      if (err.code === 'EADDRINUSE') {
+        resolve({ started: true, server: null });
+      } else {
+        logError(`proxy FAILED to start: ${err.message}`);
+        resolve({ started: false, error: err.message });
+      }
+    });
+
+    server.listen(proxyPort, '127.0.0.1', () => {
+      resolve({ started: true, server });
+    });
+  });
+}
+
+// ─── Fallback: direct mode without proxy ───
+// If the proxy fails to start, requests go directly to the real endpoint.
+// Warmup still works, but capture is unavailable (no auto-refresh).
+
+async function startFallbackHealthCheck(config) {
+  const proxyPort = config.proxyPort || 8099;
+  const targetHost = new URL(config.endpoint).hostname;
+  const targetPort = parseInt(new URL(config.endpoint).port) || 80;
+
+  // Start a minimal server that returns a clear error
+  const server = http.createServer((_req, res) => {
+    res.writeHead(502);
+    res.end(JSON.stringify({
+      error: { message: `kv-warmup proxy failed to start. Requests should go directly to ${targetHost}:${targetPort}` },
+    }));
+  });
+
+  server.on('error', () => {});
+  server.listen(proxyPort, '127.0.0.1', () => {
+    log(`fallback error server on :${proxyPort} — returns 502 with instructions`);
+  });
+}
+
+// ─── Small Model Health Cache ───
+// Cache health check result to avoid 2s timeout on every title gen
+
+let smallModelHealthy = null;
+let smallModelHealthCheckedAt = 0;
+const HEALTH_CACHE_MS = 30_000;
+
+async function isSmallModelHealthy(smallUrl) {
+  const now = Date.now();
+  if (smallModelHealthy !== null && (now - smallModelHealthCheckedAt) < HEALTH_CACHE_MS) {
+    return smallModelHealthy;
+  }
+  try {
+    const resp = await fetch(smallUrl.replace(/\/v1\/?$/, '') + '/health', {
+      signal: AbortSignal.timeout(2000),
+    });
+    smallModelHealthy = resp.ok;
+  } catch {
+    smallModelHealthy = false;
+  }
+  smallModelHealthCheckedAt = now;
+  if (!smallModelHealthy) {
+    log('MoE server unhealthy — title gen will hit dense server (KV cache at risk)');
+    writeStatus('warning', 'MoE server down — title gen may evict KV cache');
+  }
+  return smallModelHealthy;
+}
+
+// ─── Plugin Entry ───
 
 export const KvWarmupPlugin = async (_ctx) => {
-  triggerWarmup();
+  const config = loadConfig();
+  if (!config.enabled) {
+    writeStatus('disabled', 'set enabled: true in kv-warmup.json');
+    return {};
+  }
+
+  // Start embedded proxy
+  let proxyOk = false;
+  if (config.endpoint) {
+    const result = await startProxy(config);
+    proxyOk = result.started;
+
+    if (!proxyOk) {
+      logError(`CRITICAL: proxy failed — OpenCode baseURL points to dead port`);
+      logError(`FIX: either fix the port conflict or change baseURL in opencode.json to ${config.endpoint}/v1`);
+      writeStatus('error', `proxy failed to start: ${result.error}. Change baseURL to ${config.endpoint}/v1`);
+      await startFallbackHealthCheck(config);
+    }
+  }
+
+  initWarmup(config);
 
   return {
     event: async ({ event } = {}) => {
       if (event && event.type === 'session.created') {
-        promptCaptured = false;
+        // Reset small model health cache on new session
+        smallModelHealthy = null;
       }
     },
 
-    'experimental.chat.system.transform': async (_input, output) => {
-      if (!output || !Array.isArray(output.system)) return;
+    // Redirect small model tasks (title gen) to a secondary endpoint
+    // so they don't evict the warmed KV cache on the primary server.
+    'experimental.provider.small_model': async (_input, output) => {
+      const cfg = loadConfig();
+      const smallUrl = cfg.smallModelEndpoint;
+      if (!smallUrl) return;
 
-      // DO NOT inject warmup status into system prompt — it modifies the
-      // prompt tokens and breaks prefix cache matching with the warmup
-      // request. Status is shown in the TUI sidebar instead.
+      const healthy = await isSmallModelHealthy(smallUrl);
+      if (!healthy) return;
 
-      if (promptCaptured) return;
+      output.model = {
+        id: 'kv-warmup-small-model',
+        providerID: 'kv-warmup-moe',
+        api: {
+          id: 'kv-warmup-moe',
+          url: smallUrl,
+          npm: '@ai-sdk/openai-compatible',
+        },
+        name: 'KV Warmup Small Model',
+        capabilities: {
+          temperature: true,
+          reasoning: false,
+          attachment: false,
+          toolcall: false,
+          input: { text: true, audio: false, image: false, video: false, pdf: false },
+          output: { text: true, audio: false, image: false, video: false, pdf: false },
+          interleaved: false,
+        },
+        cost: { input: 0, output: 0, cache: { read: 0, write: 0 } },
+        limit: { context: 131072, output: 8192 },
+        status: 'active',
+        options: { apiKey: 'not-needed' },
+        headers: {},
+        release_date: '2025-01-01',
+      };
+    },
 
-      const systemContent = output.system.join('\n\n');
-      if (systemContent.length < 3000) {
-        log(`skipped short prompt (${systemContent.length} chars)`);
-        return;
-      }
-
-      cancelWarmup();
-
-      // Only save if NO proxy capture exists — proxy capture has the exact
-      // request body (2 system messages, compact tools) that matches what
-      // OpenCode sends. Hook-based capture produces a different format
-      // (1 joined system message, full schemas) that doesn't prefix-match.
-      const existing = loadCapturedRequest();
-      if (!existing || !existing.tools || existing.tools.length === 0) {
-        const messages = [
-          { role: 'system', content: systemContent },
-          { role: 'user', content: 'ping' },
-        ];
-        saveCapturedRequest(messages);
-        log(`system prompt captured as fallback (${systemContent.length} chars)`);
-      } else {
-        log(`proxy capture preserved (${systemContent.length} chars current prompt)`);
-      }
-      promptCaptured = true;
+    // System transform — no modifications. Status shown in TUI sidebar.
+    'experimental.chat.system.transform': async (_input, _output) => {
+      // DO NOT inject status into system prompt — breaks prefix cache matching.
     },
   };
 };
