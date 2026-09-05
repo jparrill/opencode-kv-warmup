@@ -75,44 +75,61 @@ Any modification to `output.system` in the `experimental.chat.system.transform` 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────────────────┐
-│ OpenCode                                                 │
-│  provider baseURL → http://127.0.0.1:8099/v1             │
-│                                                          │
-│  ┌─────────────────────────────────────────────────────┐ │
-│  │ plugin.js (runs inside OpenCode process)             │ │
-│  │                                                      │ │
-│  │  On boot:                                            │ │
-│  │    1. Start HTTP proxy on 127.0.0.1:8099             │ │
-│  │    2. Load captured request for cwd from disk        │ │
-│  │    3. Replay to real endpoint (max_tokens:1)         │ │
-│  │                                                      │ │
-│  │  Proxy (always running):                             │ │
-│  │    All requests → capture first large one → forward  │ │
-│  │                                                      │ │
-│  │  Small model hook:                                   │ │
-│  │    Title gen → MoE endpoint (8091)                   │ │
-│  │    (prevents KV eviction on dense server)            │ │
-│  └─────────────┬────────────────────────────────────────┘ │
-└────────────────┼──────────────────────────────────────────┘
-                 │
-    ┌────────────┼─────────────────┐
-    │ warmup     │ proxy forward   │
-    │ (direct)   │                 │
-    ▼            ▼                 │
-┌─────────────────────┐    ┌──────┴──────────┐
-│ Dense server :8090  │    │ MoE server :8091│
-│ (KV cache primed)   │    │ (title gen)     │
-└─────────────────────┘    └─────────────────┘
-```
+                          OpenCode process
+┌────────────────────────────────────────────────────────────┐
+│                                                            │
+│  baseURL: http://127.0.0.1:8099/v1                         │
+│                                                            │
+│  ┌──────────────────────────────────────────────────────┐  │
+│  │ plugin.js                                            │  │
+│  │                                                      │  │
+│  │  ┌────────────────────────────────────────────────┐  │  │
+│  │  │ Embedded Proxy (:8099)                         │  │  │
+│  │  │                                                │  │  │
+│  │  │  1. Receive request from OpenCode              │  │  │
+│  │  │  2. Capture first large body per session       │  │  │
+│  │  │  3. Forward to real endpoint                   │  │  │
+│  │  └──────────────────┬─────────────────────────────┘  │  │
+│  │                     │                                │  │
+│  │  On boot:           │                                │  │
+│  │    Load capture     │   Small model hook:            │  │
+│  │    for cwd, replay  │     Title gen ──────────────┐  │  │
+│  │    (max_tokens:1)   │                             │  │  │
+│  └─────────────────────┼─────────────────────────────┼──┘  │
+│                        │                             │     │
+└────────────────────────┼─────────────────────────────┼─────┘
+                         │                             │
+              ┌──────────┘                             │
+              │                                        │
+              ▼                                        ▼
+┌───────────────────────────┐       ┌───────────────────────────┐
+│  Dense server :8090       │       │  MoE server :8091         │
+│                           │       │                           │
+│  - Main chat completions  │       │  - Title generation       │
+│  - KV cache (single slot) │       │  - Keeps dense KV intact  │
+└───────────────────────────┘       └───────────────────────────┘
 
-```
-┌─────────────────────────────────────────────────────┐
-│ TUI sidebar (tui.tsx)                               │
-│                                                     │
-│  Reads .kv-warmup-status.json every 1.5s            │
-│  Shows: ● Ready | ◐ Warming | ◌ Cancelled | ✗ Error│
-└─────────────────────────────────────────────────────┘
+
+                          Disk (per directory)
+┌────────────────────────────────────────────────────────────┐
+│                                                            │
+│  ~/.config/opencode/                                       │
+│  ├── kv-warmup.json              Config (hot-reloaded)     │
+│  ├── .kv-warmup-status.json      State for TUI sidebar     │
+│  ├── .kv-warmup-captures/                                  │
+│  │   ├── a76a9c475300.json       Capture for ~/project-a   │
+│  │   └── f3b21e887c04.json       Capture for ~/project-b   │
+│  └── .kv-warmup-debug/           Cross-session diff dumps  │
+│                                                            │
+└──────────────────────────────┬─────────────────────────────┘
+                               │
+                               ▼
+┌────────────────────────────────────────────────────────────┐
+│  TUI sidebar (tui.tsx)                                     │
+│                                                            │
+│  Polls .kv-warmup-status.json every 1.5s                   │
+│  [Ready] [Warming] [No cache] [Error] [Disabled]           │
+└────────────────────────────────────────────────────────────┘
 ```
 
 ## Files
