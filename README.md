@@ -20,6 +20,8 @@ Additionally, for single-slot mode (`-np 1`), the plugin redirects OpenCode's in
 
 **Result: TTFT drops from ~44s to ~1s with `-np 1`.**
 
+![KV Warmup Ready](docs/warmup-ready.png)
+
 ## Why a proxy is required
 
 The proxy is not optional. No combination of OpenCode plugin hooks can produce a request body that matches what OpenCode actually sends to the API.
@@ -119,7 +121,9 @@ Any modification to `output.system` in the `experimental.chat.system.transform` 
 |------|---------|
 | `plugin.js` | Embedded proxy + warmup on boot + small model redirect |
 | `tui.tsx` | TUI sidebar panel: shows warmup state with colored indicators |
+| `test/plugin.test.js` | Unit tests for core functions and proxy forwarding |
 | `package.json` | Package metadata |
+| `Makefile` | `make test`, `make lint`, `make check` |
 
 ### Runtime files (in `~/.config/opencode/`)
 
