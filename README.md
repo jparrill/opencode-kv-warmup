@@ -207,6 +207,14 @@ DESTS=("$HOME/.agents/skills" "$HOME/.claude/skills")
 
 On first boot in a directory, no captured request exists. Send any message — the proxy captures the request body. The first message processes from scratch (~44s). On the **second** boot in that directory, the warmup replays that capture.
 
+**Important**: if you change the skill setup (add/remove skills, fix duplicate symlinks, etc.), you must purge stale captures. Otherwise the warmup will prime the KV cache with outdated tokens that don't match the current system prompt:
+
+```bash
+rm ~/.config/opencode/.kv-warmup-captures/*.json
+```
+
+Or set `"clearCache": true` in `kv-warmup.json` to clear the capture for the current directory only.
+
 ### 5. Verify
 
 The warmup runs in the background when OpenCode starts. There is no visible indicator on the welcome screen — the TUI sidebar panel only appears after the first message is sent. To verify the warmup is working:
