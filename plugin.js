@@ -13,9 +13,9 @@
 // Config: ~/.config/opencode/kv-warmup.json
 //   {
 //     "enabled": true,
-//     "endpoint": "http://100.77.65.108:8090",
+//     "endpoint": "http://your-llama-server:8090",
 //     "proxyPort": 8099,
-//     "smallModelEndpoint": "http://100.77.65.108:8091/v1",
+//     "smallModelEndpoint": "http://your-llama-server:8091/v1",
 //     "clearCache": false        // set true to delete capture for current dir (auto-resets)
 //   }
 //
@@ -311,7 +311,6 @@ async function isSmallModelHealthy(smallUrl) {
   }
   smallModelHealthCheckedAt = now;
   if (!smallModelHealthy) {
-    log('MoE server unhealthy — title gen will hit dense server (KV cache at risk)');
     writeStatus('warning', 'MoE server down — title gen may evict KV cache');
   }
   return smallModelHealthy;

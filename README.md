@@ -20,15 +20,17 @@ Additionally, for single-slot mode (`-np 1`), the plugin redirects OpenCode's in
 
 **Result: TTFT drops from ~44s to ~1s with `-np 1`.**
 
-### Before (no cache warmup) — TTFT ~44s
+### Before (no cache — TTFT ~39s)
 
-![Before proxy caching](docs/demo-before.gif)
+![No cache](docs/kv-no-cache.png)
 
-### After (with cache warmup) — TTFT ~1s
+![TTFT 38.7s without cache](docs/kv-no-cache-ttft.png)
 
-![After proxy caching](docs/demo-after.gif)
+### After (cache warmed — TTFT 1.0s)
 
-![KV Warmup Ready](docs/warmup-ready.png)
+![KV Warmup home screen](docs/kv-ready-home.png)
+
+![KV Warmup TTFT 1.0s](docs/kv-ready-ttft.png)
 
 ## Why a proxy is required
 
@@ -54,7 +56,9 @@ The embedded proxy intercepts the actual HTTP request that OpenCode sends. This 
 
 The proxy is ~50 lines of `http.createServer` with no dependencies. It runs in-process, adds no measurable latency to forwarded requests, and requires only changing `baseURL` from `http://server:8090/v1` to `http://localhost:8099/v1`.
 
-## Prerequisites: deterministic system prompt
+## Prerequisites
+
+### 1. Deterministic system prompt
 
 For KV cache reuse across sessions, the system prompt token sequence must be identical between consecutive OpenCode launches in the same directory on the same day.
 
@@ -62,19 +66,31 @@ For KV cache reuse across sessions, the system prompt token sequence must be ide
 
 **Fix**: link each skill to exactly **one** directory (e.g., `~/.agents/skills/` only). Both Claude Code and OpenCode discover skills from `~/.agents/skills/`.
 
-## Other design constraints
+### 2. Prevent KV eviction from title generation
 
-### Title gen evicts KV cache on single slot
+After the first message, OpenCode sends an internal request to generate a conversation title. This evicts the warmed KV cache, making the second turn slow again (~39s). **Without one of the following, the plugin does not work.**
 
-With `-np 1`, OpenCode's internal title-generation request evicts the warmed KV cache before the user's real request arrives:
+Pick one:
+
+**Option A: Two servers (recommended for `-np 1`)**
+
+Run a secondary model (e.g., a small MoE) on a separate port and set `smallModelEndpoint` in the config. The plugin redirects title gen to the secondary server, keeping the dense server's KV cache intact.
 
 ```
-warmup fills slot 0 (KV primed)
-title gen evicts slot 0 (KV lost!)
-user request reprocesses from scratch (warmup wasted)
+Dense server (:8090) — chat only, KV cache preserved
+MoE server (:8091)   — title gen, no KV conflict
 ```
 
-The plugin redirects title gen to a separate MoE endpoint (`smallModelEndpoint`), so the dense server's KV cache is never touched by non-conversation requests.
+**Option B: Two slots (`-np 2`)**
+
+Run llama-server with `-np 2`. Title gen uses slot 1, chat stays in slot 0. No secondary server needed.
+
+```
+Slot 0 — chat (KV cache preserved)
+Slot 1 — title gen (separate KV)
+```
+
+**Trade-off**: `-np 2` doubles KV cache VRAM usage. With large contexts this can be significant.
 
 ### The plugin must not modify the system prompt
 
