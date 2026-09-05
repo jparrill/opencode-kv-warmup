@@ -1,5 +1,5 @@
 {
-  "name": "kv-warmup-opencode-plugin",
+  "name": "opencode-kv-warmup",
   "version": "0.2.0",
   "description": "Pre-warm llama-server KV cache on session start to reduce TTFT",
   "type": "module",

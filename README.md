@@ -1,4 +1,4 @@
-# kv-warmup
+# opencode-kv-warmup
 
 OpenCode plugin that pre-warms llama-server's KV cache at boot, reducing first-turn TTFT from ~44s to ~1s.
 
@@ -191,7 +191,7 @@ In `~/.config/opencode/opencode.json`:
     }
   },
   "plugin": [
-    "/path/to/kv-warmup/plugin.js"
+    "/path/to/opencode-kv-warmup/plugin.js"
   ]
 }
 ```
