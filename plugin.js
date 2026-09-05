@@ -25,7 +25,7 @@
 //
 // OpenCode provider baseURL must point to: http://localhost:<proxyPort>/v1
 
-import { readFileSync, writeFileSync, mkdirSync, unlinkSync } from 'node:fs';
+import { readFileSync, writeFileSync, mkdirSync, unlinkSync, readdirSync } from 'node:fs';
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import http from 'node:http';
@@ -81,12 +81,12 @@ function loadCapturedRequest() {
 function saveCapturedRequest(body) {
   try {
     mkdirSync(CAPTURES_DIR, { recursive: true });
-    writeFileSync(requestPath(), JSON.stringify({
+    const serialized = JSON.stringify({
       body,
       directory: process.cwd(),
       timestamp: new Date().toISOString(),
-      bodySize: JSON.stringify(body).length,
-    }, null, 2), 'utf8');
+    }, null, 2);
+    writeFileSync(requestPath(), serialized, 'utf8');
   } catch {}
 }
 
@@ -105,11 +105,7 @@ function saveConfig(cfg) {
   } catch {}
 }
 
-let warmupInFlight = false;
-let warmupAbort = null;
 let capturedThisSession = false;
-
-function log() {}
 
 function logError(msg) {
   const ts = new Date().toISOString().slice(11, 19);
@@ -123,6 +119,12 @@ function dumpRequestForDiff(parsed) {
     const ts = new Date().toISOString().replace(/[:.]/g, '-');
     const file = join(DEBUG_DIR, `${hash}_${ts}.json`);
     writeFileSync(file, JSON.stringify(parsed, null, 2), 'utf8');
+    const files = readdirSync(DEBUG_DIR)
+      .filter(f => f.startsWith(hash + '_') && f.endsWith('.json'))
+      .sort();
+    while (files.length > 10) {
+      unlinkSync(join(DEBUG_DIR, files.shift()));
+    }
   } catch {}
 }
 
@@ -191,8 +193,6 @@ function initWarmup(config) {
 
 // ─── Embedded Proxy ───
 
-let inlineWarmupDone = false;
-
 function forwardRequest(targetHost, targetPort, req, res, rawBody) {
   const proxyReq = http.request({
     hostname: targetHost,
@@ -235,14 +235,10 @@ function startProxy(config) {
       if (hotConfig.clearCache) {
         deleteCapturedRequest();
         capturedThisSession = false;
-        inlineWarmupDone = false;
         hotConfig.clearCache = false;
         saveConfig(hotConfig);
         writeStatus('cache-cleared', 'capture deleted, will re-capture on next message');
       }
-
-      // Disabled: inline warmup adds 43.5s when KV is cold.
-      // TODO: re-enable once we fix the ~32% system prompt token drift between sessions.
 
       if (isChatCompletion && hotConfig.enabled !== false && !capturedThisSession) {
         capturedThisSession = true;
@@ -259,15 +255,12 @@ function startProxy(config) {
 
   return new Promise((resolve) => {
     server.on('error', err => {
-      if (err.code === 'EADDRINUSE') {
-        resolve({ started: true, server: null });
-      } else {
-        logError(`proxy FAILED to start: ${err.message}`);
-        resolve({ started: false, error: err.message });
-      }
+      logError(`proxy FAILED to start: ${err.message}`);
+      resolve({ started: false, error: err.message });
     });
 
     server.listen(proxyPort, '127.0.0.1', () => {
+      server.unref();
       resolve({ started: true, server });
     });
   });
@@ -292,7 +285,7 @@ async function startFallbackHealthCheck(config) {
 
   server.on('error', () => {});
   server.listen(proxyPort, '127.0.0.1', () => {
-    log(`fallback error server on :${proxyPort} — returns 502 with instructions`);
+    server.unref();
   });
 }
 
