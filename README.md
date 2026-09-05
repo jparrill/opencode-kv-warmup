@@ -205,13 +205,21 @@ DESTS=("$HOME/.agents/skills" "$HOME/.claude/skills")
 
 ### 4. First run (bootstrap)
 
-On first boot in a directory, no captured request exists. The sidebar shows `No cache`. Send any message — the proxy captures it. On the **second** boot in that directory, warmup uses that capture.
+On first boot in a directory, no captured request exists. Send any message — the proxy captures the request body. The first message processes from scratch (~44s). On the **second** boot in that directory, the warmup replays that capture.
 
 ### 5. Verify
 
-Start OpenCode. The sidebar should show `Warming...` then `Ready` after ~44s. Send a message — TTFT should be ~1s instead of ~44s.
+The warmup runs in the background when OpenCode starts. There is no visible indicator on the welcome screen — the TUI sidebar panel only appears after the first message is sent. To verify the warmup is working:
 
-Check llama-server logs for `LCP similarity` — values above 0.95 confirm prefix cache hit.
+1. Start OpenCode and **wait ~45 seconds** before typing (let the background warmup finish)
+2. Send any message — TTFT should be ~1s instead of ~44s
+3. The sidebar will show `Ready` with warmup timing details
+
+Alternatively, check llama-server logs for `LCP similarity` — values above 0.95 confirm prefix cache hit. You can also inspect the status file directly:
+
+```bash
+cat ~/.config/opencode/.kv-warmup-status.json
+```
 
 ### Hot-reload controls
 
