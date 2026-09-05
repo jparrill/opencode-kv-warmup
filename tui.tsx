@@ -1,16 +1,19 @@
 /** @jsxImportSource @opentui/solid */
 
-// kv-warmup TUI sidebar panel
+// kv-warmup TUI plugin
 //
-// Shows KV cache warmup status in OpenCode's right sidebar.
+// Shows KV cache warmup status in:
+//   1. Home screen footer (visible before first message)
+//   2. Session sidebar (visible during conversation)
+//
 // Reads status from a JSON file written by the server-side plugin.js.
-// Uses dynamic import for node:fs to gracefully handle restricted runtimes.
 
 import type { TuiPlugin, TuiPluginModule } from "@opencode-ai/plugin/tui"
 import { createSignal, onCleanup } from "solid-js"
 
 const id = "kv-warmup"
 const SIDEBAR_ORDER = 160
+const HOME_ORDER = 90
 const REFRESH_MS = 1500
 
 interface WarmupStatus {
@@ -55,51 +58,58 @@ function stateLabel(state: string): string {
     case "error": return "Error"
     case "no-cache": return "No cache"
     case "disabled": return "Disabled"
+    case "cache-cleared": return "Cleared"
+    case "diagnostic": return "Diagnostic"
     default: return "Idle"
   }
 }
 
-function stateIcon(state: string): string {
+function stateColor(state: string, theme: any): string {
   switch (state) {
-    case "warming": return "◐"
-    case "ready": return "●"
-    case "cancelled": return "◌"
-    case "error": return "✗"
-    case "no-cache": return "○"
-    case "disabled": return "−"
-    default: return "·"
+    case "ready": return "#4ade80"
+    case "warming": return "#facc15"
+    case "error": return "#f87171"
+    case "cancelled":
+    case "disabled": return "#94a3b8"
+    default: return theme.textMuted
   }
 }
 
-function SidebarWarmupView(props: { api: any }) {
+function useStatus() {
   const [status, setStatus] = createSignal<WarmupStatus>(readStatus())
-
   const interval = setInterval(() => setStatus(readStatus()), REFRESH_MS)
   onCleanup(() => clearInterval(interval))
+  return status
+}
 
-  const color = () => {
-    switch (status().state) {
-      case "ready": return "#4ade80"
-      case "warming": return "#facc15"
-      case "error": return "#f87171"
-      case "cancelled": return "#94a3b8"
-      default: return props.api.theme.current.textMuted
-    }
-  }
+function SidebarView(props: { api: any }) {
+  const status = useStatus()
 
   return (
     <box gap={0}>
       <text fg={props.api.theme.current.text}>
         <b>KV Warmup</b>
       </text>
-      <text fg={color()} wrapMode="none">
-        {stateIcon(status().state)} {stateLabel(status().state)}
+      <text fg={stateColor(status().state, props.api.theme.current)} wrapMode="none">
+        {stateLabel(status().state)}
       </text>
       {status().detail && (
         <text fg={props.api.theme.current.textMuted} wrapMode="none">
           {status().detail.slice(0, 40)}
         </text>
       )}
+    </box>
+  )
+}
+
+function HomeFooterView(props: { api: any }) {
+  const status = useStatus()
+  const theme = () => props.api.theme.current
+
+  return (
+    <box gap={1} flexDirection="row" flexShrink={0}>
+      <text fg={stateColor(status().state, theme())}>KV</text>
+      <text fg={theme().textMuted}>{stateLabel(status().state)}</text>
     </box>
   )
 }
@@ -111,7 +121,16 @@ const tui: TuiPlugin = async (api) => {
     order: SIDEBAR_ORDER,
     slots: {
       sidebar_content(_ctx: any, _props: { session_id: string }) {
-        return <SidebarWarmupView api={api} />
+        return <SidebarView api={api} />
+      },
+    },
+  })
+
+  api.slots.register({
+    order: HOME_ORDER,
+    slots: {
+      home_footer() {
+        return <HomeFooterView api={api} />
       },
     },
   })
